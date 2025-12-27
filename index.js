@@ -1,31 +1,3 @@
-//"@0i@~G@e&hVKFrV&"
-
-
-
-/**
- * server.js — FULLCODE com “Error-first UX”
- *
- * ✅ Se MySQL / schema falhar:
- *    - A página HTML CONTINUA a abrir (não quebra)
- *    - Mostra um banner bonito com erro no topo (no lugar do “conteúdo”)
- *    - Botão “Tentar novamente”
- *    - App desativa botões de CRUD enquanto estiver offline
- *
- * ✅ API robusta:
- *    - Respostas JSON consistentes
- *    - 503 quando DB/schema indisponível
- *    - Handler global de erros
- *
- * ⚠️ IMPORTANTE: Não hardcode password no código (risco de leak).
- *    Usa ENV vars: MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
- *
- * Instalar:
- *   npm i express cors mysql2
- *
- * Rodar:
- *   MYSQL_HOST=... MYSQL_USER=... MYSQL_PASSWORD=... MYSQL_DATABASE=... node server.js
- */
-
 const express = require("express");
 const cors = require("cors");
 const mysql = require("mysql2/promise");
@@ -34,10 +6,10 @@ const mysql = require("mysql2/promise");
 const PORT = process.env.PORT || 4000;
 
 const DB = {
-  host: process.env.MYSQL_HOST || "cpanel154.dnscpanel.com",
-  user: process.env.MYSQL_USER || "eduallsi_cisco",
-  password: process.env.MYSQL_PASSWORD || "@0i@~G@e&hVKFrV&",
-  database: process.env.MYSQL_DATABASE || "eduallsi_cisco",
+  host:"cpanel154.dnscpanel.com",
+  user:"eduallsi_cisco",
+  password:"@0i@~G@e&hVKFrV&",
+  database:"eduallsi_cisco",
   connectionLimit: 10,
 };
 
