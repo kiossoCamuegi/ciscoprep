@@ -1,3 +1,31 @@
+//"@0i@~G@e&hVKFrV&"
+
+
+
+/**
+ * server.js — FULLCODE com “Error-first UX”
+ *
+ * ✅ Se MySQL / schema falhar:
+ *    - A página HTML CONTINUA a abrir (não quebra)
+ *    - Mostra um banner bonito com erro no topo (no lugar do “conteúdo”)
+ *    - Botão “Tentar novamente”
+ *    - App desativa botões de CRUD enquanto estiver offline
+ *
+ * ✅ API robusta:
+ *    - Respostas JSON consistentes
+ *    - 503 quando DB/schema indisponível
+ *    - Handler global de erros
+ *
+ * ⚠️ IMPORTANTE: Não hardcode password no código (risco de leak).
+ *    Usa ENV vars: MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
+ *
+ * Instalar:
+ *   npm i express cors mysql2
+ *
+ * Rodar:
+ *   MYSQL_HOST=... MYSQL_USER=... MYSQL_PASSWORD=... MYSQL_DATABASE=... node server.js
+ */
+
 const express = require("express");
 const cors = require("cors");
 const mysql = require("mysql2/promise");
@@ -5,36 +33,509 @@ const mysql = require("mysql2/promise");
 // -------------------- CONFIG --------------------
 const PORT = process.env.PORT || 4000;
 
- 
+const DB = {
+  host: process.env.MYSQL_HOST || "cpanel154.dnscpanel.com",
+  user: process.env.MYSQL_USER || "eduallsi_cisco",
+  password: process.env.MYSQL_PASSWORD || "@0i@~G@e&hVKFrV&",
+  database: process.env.MYSQL_DATABASE || "eduallsi_cisco",
+  connectionLimit: 10,
+};
 
-const CISCO_LOGO = "https://upload.wikimedia.org/wikipedia/commons/thumb/6/64/Cisco_logo.svg/1200px-Cisco_logo.svg.png";
+const CISCO_LOGO =
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/6/64/Cisco_logo.svg/1200px-Cisco_logo.svg.png";
 
- 
+// -------------------- DB POOL --------------------
+const pool = mysql.createPool({
+  ...DB,
+  waitForConnections: true,
+  namedPlaceholders: true,
+});
+
 // -------------------- APP --------------------
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
- 
+// -------------------- SMALL UTILS --------------------
+function badRequest(res, msg) {
+  return res.status(400).json({ ok: false, error: msg });
+}
+function notFound(res, msg = "Not found") {
+  return res.status(404).json({ ok: false, error: msg });
+}
+function isValidStatus(s) {
+  return ["todo", "doing", "done"].includes(s);
+}
+function isValidPriority(p) {
+  return ["P1", "P2", "P3"].includes(p);
+}
+function toInt(x, def = 0) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : def;
+}
+function safeErrMsg(e) {
+  // evita devolver detalhes sensíveis (stack, credenciais, SQL)
+  const msg = String(e?.message || "Unexpected error");
+  return msg.length > 220 ? msg.slice(0, 220) + "…" : msg;
+}
+function asyncRoute(fn) {
+  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+}
 
-// -------------------- FRONTEND --------------------
-app.get("/", async (req, res) => {
-  try {
-   // await ensureSchema();
-  } catch (e) {
-    console.error("Schema init error on /:", e);
+// -------------------- AUTO-SCHEMA (robusto) --------------------
+let schemaReady = false;
+let schemaPromise = null;
+let lastSchemaError = null;
+
+async function ensureSchema() {
+  if (schemaReady) return true;
+  if (schemaPromise) return schemaPromise;
+
+  schemaPromise = (async () => {
+    const conn = await pool.getConnection();
+    try {
+      await conn.query(`USE \`${DB.database}\``);
+
+      await conn.query(`
+        CREATE TABLE IF NOT EXISTS \`groups\` (
+          \`id\` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+          \`title\` VARCHAR(120) NOT NULL,
+          \`position\` INT NOT NULL DEFAULT 0,
+          \`collapsed\` TINYINT(1) NOT NULL DEFAULT 0,
+          \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          \`updated_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          PRIMARY KEY (\`id\`),
+          INDEX \`idx_groups_position\` (\`position\`)
+        ) ENGINE=InnoDB
+          DEFAULT CHARSET=utf8mb4
+          COLLATE=utf8mb4_unicode_ci;
+      `);
+
+      await conn.query(`
+        CREATE TABLE IF NOT EXISTS \`items\` (
+          \`id\` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+          \`group_id\` BIGINT UNSIGNED NOT NULL,
+          \`title\` VARCHAR(180) NOT NULL,
+          \`status\` ENUM('todo','doing','done') NOT NULL DEFAULT 'todo',
+          \`priority\` ENUM('P1','P2','P3') NOT NULL DEFAULT 'P3',
+          \`due_date\` DATE NULL,
+          \`notes\` VARCHAR(300) NULL,
+          \`position\` INT NOT NULL DEFAULT 0,
+          \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          \`updated_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          PRIMARY KEY (\`id\`),
+          INDEX \`idx_items_group\` (\`group_id\`),
+          INDEX \`idx_items_status\` (\`status\`),
+          INDEX \`idx_items_priority\` (\`priority\`),
+          INDEX \`idx_items_position\` (\`position\`)
+        ) ENGINE=InnoDB
+          DEFAULT CHARSET=utf8mb4
+          COLLATE=utf8mb4_unicode_ci;
+      `);
+
+      const [fkRows] = await conn.query(
+        `
+        SELECT CONSTRAINT_NAME
+        FROM information_schema.TABLE_CONSTRAINTS
+        WHERE CONSTRAINT_SCHEMA = :db
+          AND TABLE_NAME = 'items'
+          AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+          AND CONSTRAINT_NAME = 'fk_items_group'
+        `,
+        { db: DB.database }
+      );
+
+      if (fkRows.length === 0) {
+        await conn.query(`
+          ALTER TABLE \`items\`
+          ADD CONSTRAINT \`fk_items_group\`
+            FOREIGN KEY (\`group_id\`)
+            REFERENCES \`groups\`(\`id\`)
+            ON DELETE CASCADE;
+        `);
+      }
+
+      schemaReady = true;
+      lastSchemaError = null;
+      return true;
+    } catch (e) {
+      schemaReady = false;
+      lastSchemaError = e;
+      throw e;
+    } finally {
+      conn.release();
+      // IMPORTANTE: permite nova tentativa futura se falhar
+      schemaPromise = null;
+    }
+  })();
+
+  return schemaPromise;
+}
+
+// Middleware API: se schema/db falhar => 503 (não “quebra” a página)
+app.use(
+  "/api",
+  asyncRoute(async (req, res, next) => {
+    try {
+      await ensureSchema();
+      return next();
+    } catch (e) {
+      // 503 = Service Unavailable
+      return res.status(503).json({
+        ok: false,
+        error: "Base de dados indisponível. Tenta novamente em instantes.",
+      });
+    }
+  })
+);
+
+// -------------------- API --------------------
+app.get(
+  "/api/health",
+  asyncRoute(async (req, res) => {
+    // health precisa ser “honesto”
+    try {
+      await pool.query("SELECT 1");
+      res.json({ ok: true, db: "ok" });
+    } catch (e) {
+      res.status(503).json({ ok: false, db: "down", error: "DB not reachable" });
+    }
+  })
+);
+
+/**
+ * GET /api/board?q=...
+ */
+app.get(
+  "/api/board",
+  asyncRoute(async (req, res) => {
+    const q = String(req.query.q || "").trim().toLowerCase();
+
+    const conn = await pool.getConnection();
+    try {
+      const [groups] = await conn.query(
+        "SELECT id, title, position, collapsed, created_at, updated_at FROM `groups` ORDER BY position ASC, id ASC"
+      );
+
+      let itemsSql =
+        "SELECT id, group_id, title, status, priority, due_date, notes, position, created_at, updated_at " +
+        "FROM `items` ";
+      const params = {};
+
+      if (q) {
+        itemsSql +=
+          "WHERE LOWER(title) LIKE :q OR LOWER(IFNULL(notes,'')) LIKE :q OR LOWER(status) LIKE :q OR LOWER(priority) LIKE :q ";
+        params.q = `%${q}%`;
+      }
+      itemsSql += "ORDER BY group_id ASC, position ASC, id ASC";
+
+      const [items] = await conn.query(itemsSql, params);
+
+      const map = new Map();
+      for (const g of groups) map.set(g.id, { ...g, items: [] });
+      for (const it of items) {
+        const g = map.get(it.group_id);
+        if (g) g.items.push(it);
+      }
+
+      const result = [...map.values()].filter((g) => !q || g.items.length > 0);
+      res.json({ ok: true, groups: result });
+    } finally {
+      conn.release();
+    }
+  })
+);
+
+/**
+ * POST /api/groups { title }
+ */
+app.post(
+  "/api/groups",
+  asyncRoute(async (req, res) => {
+    const title = String(req.body?.title || "").trim();
+    if (!title) return badRequest(res, "title is required");
+
+    const conn = await pool.getConnection();
+    try {
+      const [[maxRow]] = await conn.query(
+        "SELECT COALESCE(MAX(position), 0) AS maxPos FROM `groups`"
+      );
+      const position = (maxRow?.maxPos ?? 0) + 1;
+
+      const [r] = await conn.query(
+        "INSERT INTO `groups` (title, position, collapsed) VALUES (:title, :position, 0)",
+        { title, position }
+      );
+
+      const [rows] = await conn.query(
+        "SELECT id, title, position, collapsed, created_at, updated_at FROM `groups` WHERE id = :id",
+        { id: r.insertId }
+      );
+
+      res.status(201).json({ ok: true, group: rows[0] });
+    } finally {
+      conn.release();
+    }
+  })
+);
+
+/**
+ * PATCH /api/groups/:id { title?, collapsed?, position? }
+ */
+app.patch(
+  "/api/groups/:id",
+  asyncRoute(async (req, res) => {
+    const id = toInt(req.params.id);
+    if (!id) return badRequest(res, "invalid id");
+
+    const fields = [];
+    const params = { id };
+
+    if (req.body?.title !== undefined) {
+      const title = String(req.body.title).trim();
+      if (!title) return badRequest(res, "title cannot be empty");
+      fields.push("title = :title");
+      params.title = title;
+    }
+    if (req.body?.collapsed !== undefined) {
+      fields.push("collapsed = :collapsed");
+      params.collapsed = req.body.collapsed ? 1 : 0;
+    }
+    if (req.body?.position !== undefined) {
+      fields.push("position = :position");
+      params.position = toInt(req.body.position, 0);
+    }
+
+    if (fields.length === 0) return badRequest(res, "no fields to update");
+
+    const conn = await pool.getConnection();
+    try {
+      const [u] = await conn.query(
+        `UPDATE \`groups\` SET ${fields.join(", ")} WHERE id = :id`,
+        params
+      );
+      if (u.affectedRows === 0) return notFound(res, "group not found");
+
+      const [rows] = await conn.query(
+        "SELECT id, title, position, collapsed, created_at, updated_at FROM `groups` WHERE id = :id",
+        { id }
+      );
+      res.json({ ok: true, group: rows[0] });
+    } finally {
+      conn.release();
+    }
+  })
+);
+
+/**
+ * DELETE /api/groups/:id
+ */
+app.delete(
+  "/api/groups/:id",
+  asyncRoute(async (req, res) => {
+    const id = toInt(req.params.id);
+    if (!id) return badRequest(res, "invalid id");
+
+    const conn = await pool.getConnection();
+    try {
+      const [d] = await conn.query("DELETE FROM `groups` WHERE id = :id", { id });
+      if (d.affectedRows === 0) return notFound(res, "group not found");
+      res.json({ ok: true });
+    } finally {
+      conn.release();
+    }
+  })
+);
+
+/**
+ * POST /api/groups/:groupId/items
+ */
+app.post(
+  "/api/groups/:groupId/items",
+  asyncRoute(async (req, res) => {
+    const groupId = toInt(req.params.groupId);
+    if (!groupId) return badRequest(res, "invalid groupId");
+
+    const title = String(req.body?.title || "").trim();
+    if (!title) return badRequest(res, "title is required");
+
+    const status = String(req.body?.status || "todo");
+    const priority = String(req.body?.priority || "P3");
+    const due_date = req.body?.due_date ? String(req.body.due_date) : null;
+    const notes = req.body?.notes ? String(req.body.notes) : null;
+
+    if (!isValidStatus(status)) return badRequest(res, "invalid status");
+    if (!isValidPriority(priority)) return badRequest(res, "invalid priority");
+
+    const conn = await pool.getConnection();
+    try {
+      const [g] = await conn.query("SELECT id FROM `groups` WHERE id = :id", { id: groupId });
+      if (g.length === 0) return notFound(res, "group not found");
+
+      const [[maxRow]] = await conn.query(
+        "SELECT COALESCE(MAX(position), 0) AS maxPos FROM `items` WHERE group_id = :groupId",
+        { groupId }
+      );
+      const position = (maxRow?.maxPos ?? 0) + 1;
+
+      const [r] = await conn.query(
+        "INSERT INTO `items` (group_id, title, status, priority, due_date, notes, position) " +
+          "VALUES (:group_id, :title, :status, :priority, :due_date, :notes, :position)",
+        { group_id: groupId, title, status, priority, due_date, notes, position }
+      );
+
+      const [rows] = await conn.query(
+        "SELECT id, group_id, title, status, priority, due_date, notes, position, created_at, updated_at FROM `items` WHERE id = :id",
+        { id: r.insertId }
+      );
+
+      res.status(201).json({ ok: true, item: rows[0] });
+    } finally {
+      conn.release();
+    }
+  })
+);
+
+/**
+ * PATCH /api/items/:id
+ */
+app.patch(
+  "/api/items/:id",
+  asyncRoute(async (req, res) => {
+    const id = toInt(req.params.id);
+    if (!id) return badRequest(res, "invalid id");
+
+    const fields = [];
+    const params = { id };
+
+    if (req.body?.title !== undefined) {
+      const title = String(req.body.title).trim();
+      if (!title) return badRequest(res, "title cannot be empty");
+      fields.push("title = :title");
+      params.title = title;
+    }
+    if (req.body?.status !== undefined) {
+      const status = String(req.body.status);
+      if (!isValidStatus(status)) return badRequest(res, "invalid status");
+      fields.push("status = :status");
+      params.status = status;
+    }
+    if (req.body?.priority !== undefined) {
+      const priority = String(req.body.priority);
+      if (!isValidPriority(priority)) return badRequest(res, "invalid priority");
+      fields.push("priority = :priority");
+      params.priority = priority;
+    }
+    if (req.body?.due_date !== undefined) {
+      fields.push("due_date = :due_date");
+      params.due_date = req.body.due_date ? String(req.body.due_date) : null;
+    }
+    if (req.body?.notes !== undefined) {
+      fields.push("notes = :notes");
+      params.notes = req.body.notes ? String(req.body.notes) : null;
+    }
+    if (req.body?.position !== undefined) {
+      fields.push("position = :position");
+      params.position = toInt(req.body.position, 0);
+    }
+    if (req.body?.group_id !== undefined) {
+      const group_id = toInt(req.body.group_id);
+      if (!group_id) return badRequest(res, "invalid group_id");
+      fields.push("group_id = :group_id");
+      params.group_id = group_id;
+    }
+
+    if (fields.length === 0) return badRequest(res, "no fields to update");
+
+    const conn = await pool.getConnection();
+    try {
+      const [u] = await conn.query(`UPDATE \`items\` SET ${fields.join(", ")} WHERE id = :id`, params);
+      if (u.affectedRows === 0) return notFound(res, "item not found");
+
+      const [rows] = await conn.query(
+        "SELECT id, group_id, title, status, priority, due_date, notes, position, created_at, updated_at FROM `items` WHERE id = :id",
+        { id }
+      );
+      res.json({ ok: true, item: rows[0] });
+    } finally {
+      conn.release();
+    }
+  })
+);
+
+/**
+ * DELETE /api/items/:id
+ */
+app.delete(
+  "/api/items/:id",
+  asyncRoute(async (req, res) => {
+    const id = toInt(req.params.id);
+    if (!id) return badRequest(res, "invalid id");
+
+    const conn = await pool.getConnection();
+    try {
+      const [d] = await conn.query("DELETE FROM `items` WHERE id = :id", { id });
+      if (d.affectedRows === 0) return notFound(res, "item not found");
+      res.json({ ok: true });
+    } finally {
+      conn.release();
+    }
+  })
+);
+
+// -------------------- FRONTEND (HTML SEMPRE) --------------------
+app.get(
+  "/",
+  asyncRoute(async (req, res) => {
+    // Se der erro no schema, NÃO quebra — injeta um “boot error” para o frontend mostrar banner
+    let bootError = null;
+    try {
+      await ensureSchema();
+    } catch (e) {
+      bootError = "Não consegui ligar à base de dados. A app vai abrir em modo offline.";
+      console.error("Schema init error on /:", safeErrMsg(e));
+    }
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(INDEX_HTML(String(bootError || "")));
+  })
+);
+
+// -------------------- GLOBAL ERROR HANDLER --------------------
+app.use((err, req, res, next) => {
+  console.error("Unhandled route error:", safeErrMsg(err));
+
+  // Se for API, devolve JSON consistente
+  if (req.path.startsWith("/api")) {
+    return res.status(500).json({
+      ok: false,
+      error: "Erro interno no servidor.",
+    });
   }
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(INDEX_HTML);
+
+  // Se for HTML, também não quebra: devolve HTML com banner de erro
+  res
+    .status(500)
+    .setHeader("Content-Type", "text/html; charset=utf-8")
+    .send(INDEX_HTML("Erro interno no servidor. Recarrega a página."));
+});
+
+// -------------------- PROCESS SAFETY (não derrubar sem log) --------------------
+process.on("unhandledRejection", (reason) => {
+  console.error("UnhandledRejection:", safeErrMsg(reason));
+});
+process.on("uncaughtException", (err) => {
+  console.error("UncaughtException:", safeErrMsg(err));
+  // opcional: em produção, o melhor é reiniciar com PM2/Docker, mas aqui só logamos
 });
 
 // -------------------- START --------------------
 (async () => {
   try {
-   // await ensureSchema();
+    await ensureSchema();
     console.log("DB schema ready ✅");
   } catch (e) {
-    console.error("DB schema init failed (vou tentar em runtime):", e);
+    console.error("DB schema init failed (vou servir UI em modo offline):", safeErrMsg(e));
   }
 
   app.listen(PORT, () => {
@@ -42,18 +543,17 @@ app.get("/", async (req, res) => {
   });
 })();
 
+// -------------------- HTML TEMPLATE (com banner de erro) --------------------
+function INDEX_HTML(bootErrorMsg) {
+  const bootError = String(bootErrorMsg || "");
 
-
-// -------------------- HTML (Axios + UI) --------------------
-const INDEX_HTML = `<!doctype html>
+  return `<!doctype html>
 <html lang="pt">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-
   <title>Software Engineer Grade 6 — Cisco Study Board</title>
 
-  <!-- App icon (Cisco) -->
   <link rel="icon" href="${CISCO_LOGO}">
   <link rel="apple-touch-icon" href="${CISCO_LOGO}">
 
@@ -70,15 +570,11 @@ const INDEX_HTML = `<!doctype html>
       --shadow: 0 18px 60px rgba(15,23,42,.10);
       --radius: 18px;
       --radius2: 14px;
-
       --rowHover: rgba(37,99,235,.05);
       --rowSelect: rgba(37,99,235,.10);
-
-      --blue:#2563eb;
       --green:#16a34a;
       --yellow:#f59e0b;
       --gray:#64748b;
-
       --focusRing: 0 0 0 .25rem rgba(37,99,235,.18);
     }
 
@@ -87,7 +583,6 @@ const INDEX_HTML = `<!doctype html>
       color: var(--text);
       min-height: 100vh;
     }
-
     .shell{ max-width: 1900px; margin:0 auto; padding: 14px 14px 64px; }
     .panel{
       background: var(--panel);
@@ -98,13 +593,9 @@ const INDEX_HTML = `<!doctype html>
       overflow: hidden;
     }
 
-    .app-header{
-      display:flex; justify-content:space-between; align-items:center; gap:14px;
-      padding: 14px 16px;
-    }
+    .app-header{ display:flex; justify-content:space-between; align-items:center; gap:14px; padding: 14px 16px; }
     .brand{ display:flex; align-items:center; gap:12px; min-width: 360px; }
     .cisco-logo{ height: 34px; }
-
     .title{ font-weight: 950; letter-spacing:-.02em; font-size: 18px; line-height: 1.1; }
     .subtitle{ color: var(--muted); font-size: 12.5px; margin-top: 2px; }
 
@@ -128,6 +619,20 @@ const INDEX_HTML = `<!doctype html>
 
     .content{ padding: 14px 16px 18px; }
 
+    /* Error banner (fixo dentro do layout) */
+    .error-banner{
+      border: 1px solid rgba(239,68,68,.25);
+      background: rgba(254,226,226,.75);
+      border-radius: 16px;
+      padding: 14px;
+      margin-top: 12px;
+      display:none;
+    }
+    .error-banner.show{ display:block; }
+    .error-title{ font-weight: 950; color: #991b1b; }
+    .error-desc{ color: rgba(127,29,29,.92); font-size: 13px; margin-top: 4px; }
+    .error-meta{ color: rgba(127,29,29,.75); font-size: 12px; margin-top: 8px; }
+
     .group{
       border:1px solid rgba(15,23,42,.08);
       border-radius: var(--radius2);
@@ -149,7 +654,6 @@ const INDEX_HTML = `<!doctype html>
       grid-template-columns: 46px minmax(240px, 2.8fr) 1fr .9fr 1.2fr 1.7fr 120px;
       align-items:center;
     }
-
     .table-head{
       padding:10px 12px;
       font-size:12px;
@@ -157,7 +661,6 @@ const INDEX_HTML = `<!doctype html>
       background: rgba(15,23,42,.02);
       border-bottom: 1px solid rgba(15,23,42,.06);
     }
-
     .rowx{
       padding:10px 12px;
       border-bottom: 1px solid rgba(15,23,42,.06);
@@ -221,7 +724,6 @@ const INDEX_HTML = `<!doctype html>
     .form-control:focus, .form-select:focus{ box-shadow: var(--focusRing); border-color: rgba(37,99,235,.35); }
     .btn{ border-radius: 12px; font-weight: 800; }
 
-    /* ---------------- RESPONSIVE BOOST ---------------- */
     @media (max-width: 980px) {
       .app-header { flex-direction: column; align-items: stretch; gap: 10px; }
       .brand { min-width: unset; width: 100%; }
@@ -231,33 +733,14 @@ const INDEX_HTML = `<!doctype html>
       .subbar .d-flex { width: 100%; justify-content: flex-start; }
       .subbar .btn { flex: 1; min-width: 140px; }
     }
-
-    @media (max-width: 600px) {
-      .btn { padding: 10px 12px; }
-      .icon-btn { width: 44px; height: 44px; border-radius: 14px; }
-      .cisco-logo { height: 30px; }
-      .small-muted { font-size: 11px; }
-    }
-
-    /* Evita quebrar a tabela: se necessário, scroll horizontal no grupo */
     @media (max-width: 860px) {
       .group { overflow-x: auto; }
       .table-head, .rowx { min-width: 720px; }
       .hide-sm { display:none !important; }
     }
-
     @media (max-width: 1080px){
       .hide-md { display:none !important; }
       .table-head, .rowx { grid-template-columns: 44px minmax(240px, 2.6fr) 1fr .9fr 1.2fr 120px; }
-    }
-
-    @media (max-width: 860px){
-      .table-head, .rowx { grid-template-columns: 40px minmax(240px, 2.5fr) 1fr .9fr 120px; }
-    }
-
-    @media (max-width: 700px){
-      .modal-dialog { margin: 12px; }
-      .modal-content { border-radius: 16px; }
     }
   </style>
 </head>
@@ -270,7 +753,7 @@ const INDEX_HTML = `<!doctype html>
           <img class="cisco-logo" alt="Cisco" src="${CISCO_LOGO}">
           <div>
             <div class="title">Software Engineer Grade 6 — Cisco Study Board</div>
-            <div class="subtitle">Express + MySQL • UI responsiva • CRUD completo</div>
+            <div class="subtitle">Express + MySQL • App resiliente a falhas (sem quebrar a página)</div>
           </div>
         </div>
 
@@ -296,8 +779,23 @@ const INDEX_HTML = `<!doctype html>
 
       <div class="content">
         <div class="text-muted" style="font-size:12px;">
-          Clique numa linha para selecionar • Duplo clique para editar • Dados no MySQL (auto-schema)
+          Clique numa linha para selecionar • Duplo clique para editar • Se o DB cair, a UI continua viva
         </div>
+
+        <div id="errorBanner" class="error-banner">
+          <div class="d-flex align-items-start justify-content-between gap-3">
+            <div>
+              <div class="error-title" id="errorTitle">Modo offline</div>
+              <div class="error-desc" id="errorDesc">Não foi possível contactar a base de dados.</div>
+              <div class="error-meta" id="errorMeta">Podes tentar novamente — a página não vai quebrar.</div>
+            </div>
+            <div class="d-flex gap-2 flex-wrap">
+              <button class="btn btn-outline-danger btn-sm" id="btnRetry">Tentar novamente</button>
+              <button class="btn btn-outline-secondary btn-sm" id="btnHideErr">Ocultar</button>
+            </div>
+          </div>
+        </div>
+
         <div id="groupsWrap"></div>
       </div>
     </div>
@@ -400,6 +898,11 @@ const INDEX_HTML = `<!doctype html>
     </div>
   </div>
 
+  <script>
+    // Boot error vindo do servidor (se schema falhou no /)
+    window.__BOOT_ERROR__ = ${JSON.stringify(bootError)};
+  </script>
+
   <script src="https://cdn.jsdelivr.net/npm/axios@1.7.2/dist/axios.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
@@ -413,12 +916,73 @@ const INDEX_HTML = `<!doctype html>
     const modalConfirm = new bootstrap.Modal($("#modalConfirm"));
 
     function notify(msg){ $("#toastMsg").textContent = msg; toast.show(); }
+
     function escapeHtml(str){
       return String(str)
         .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
         .replaceAll('"',"&quot;").replaceAll("'","&#039;");
     }
 
+    // -------------------- ERROR UX --------------------
+    let isOffline = false;
+
+    function showErrorBanner(title, desc, meta){
+      const b = $("#errorBanner");
+      $("#errorTitle").textContent = title || "Modo offline";
+      $("#errorDesc").textContent = desc || "Não foi possível contactar a base de dados.";
+      $("#errorMeta").textContent = meta || "Podes tentar novamente — a página não vai quebrar.";
+      b.classList.add("show");
+    }
+    function hideErrorBanner(){
+      $("#errorBanner").classList.remove("show");
+    }
+    function setOffline(flag){
+      isOffline = !!flag;
+      // Desativa botões críticos quando offline
+      $("#btnAddGroup").disabled = isOffline;
+      $("#btnAddItem").disabled = isOffline || (board.groups.length === 0);
+      $("#btnEditItem").disabled = isOffline || !selected.itemId;
+      $("#btnDeleteItem").disabled = isOffline || !selected.itemId;
+      $("#searchInput").disabled = isOffline;
+    }
+
+    $("#btnRetry").addEventListener("click", async () => {
+      await hardRefresh();
+    });
+    $("#btnHideErr").addEventListener("click", hideErrorBanner);
+
+    async function hardRefresh(){
+      try{
+        await checkApi();      // muda badge
+        await loadBoard();     // tenta carregar
+        hideErrorBanner();
+        setOffline(false);
+        notify("Ligação recuperada ✅");
+      }catch(e){
+        setOffline(true);
+        showErrorBanner(
+          "Sem ligação à base de dados",
+          "A API/DB está indisponível neste momento.",
+          "Confere credenciais/env vars, host MySQL, permissões e firewall."
+        );
+      }
+    }
+
+    // Interceptor axios: não deixar “crashar”
+    axios.interceptors.response.use(
+      (r) => r,
+      (err) => {
+        // não quebra a app: devolve um erro “normalizado”
+        const status = err?.response?.status;
+        const msg =
+          err?.response?.data?.error ||
+          (status === 503 ? "DB indisponível" : "Erro de rede/servidor");
+        err.__friendly = msg;
+        return Promise.reject(err);
+      }
+    );
+
+    // -------------------- UI HELPERS --------------------
     function statusClass(s){
       if(s === "done") return "status-done";
       if(s === "doing") return "status-doing";
@@ -439,6 +1003,7 @@ const INDEX_HTML = `<!doctype html>
       try { return new Date(String(d).slice(0,10) + "T00:00:00").toLocaleDateString(); } catch { return "—"; }
     }
 
+    // -------------------- STATE --------------------
     let board = { groups: [] };
     let selected = { groupId: null, itemId: null };
     let selectedRowEl = null;
@@ -449,6 +1014,7 @@ const INDEX_HTML = `<!doctype html>
     let editingItemId = null;
     let confirmAction = null;
 
+    // -------------------- API CALLS (resilientes) --------------------
     async function checkApi(){
       try{
         await axios.get(API_BASE + "/health");
@@ -462,9 +1028,34 @@ const INDEX_HTML = `<!doctype html>
 
     async function loadBoard(){
       const q = ($("#searchInput").value || "").trim();
-      const res = await axios.get(API_BASE + "/board", { params: q ? { q } : {} });
-      board = res.data;
-      renderBoard();
+
+      try{
+        const res = await axios.get(API_BASE + "/board", { params: q ? { q } : {} });
+        board = res.data || { groups: [] };
+
+        // compat: quando API devolve {ok:true, groups:[...]}
+        if(board.ok && Array.isArray(board.groups)) {
+          // ok
+        } else if(Array.isArray(board.groups)) {
+          // ok (caso antigo)
+        } else {
+          board = { groups: [] };
+        }
+
+        renderBoard();
+        setOffline(false);
+      } catch(e){
+        // DB caiu? UI não quebra, só entra em offline
+        board = { groups: [] };
+        renderBoard();
+        setOffline(true);
+        showErrorBanner(
+          "Sem ligação à base de dados",
+          e.__friendly || "A API não respondeu. A app está em modo offline.",
+          "Tenta novamente. Se persistir, verifica o MySQL e as ENV vars."
+        );
+        throw e;
+      }
     }
 
     function groupStats(g){
@@ -478,7 +1069,39 @@ const INDEX_HTML = `<!doctype html>
       const wrap = $("#groupsWrap");
       wrap.innerHTML = "";
 
-      for(const g of board.groups){
+      if(isOffline){
+        // Em offline, deixamos só uma mensagem limpa e motivacional
+        const card = document.createElement("div");
+        card.className = "group";
+        card.innerHTML = \`
+          <div class="group-header">
+            <div>
+              <div class="group-title">Modo offline</div>
+              <div class="group-meta">
+                <span>Sem dados para mostrar</span><span>•</span>
+                <span>Assim que o DB voltar, a UI recupera</span>
+              </div>
+            </div>
+            <div class="d-flex gap-2 flex-wrap">
+              <button class="btn btn-outline-danger btn-sm" id="btnRetry2">Tentar novamente</button>
+            </div>
+          </div>
+          <div class="rowx" style="grid-template-columns:1fr;">
+            <div class="cell text-muted">
+              Dica: para uma vaga Grade 6, mostra resiliência: UI não quebra, erros são controlados, e há retry.
+            </div>
+          </div>
+        \`;
+        wrap.appendChild(card);
+
+        const btn = document.getElementById("btnRetry2");
+        if(btn) btn.addEventListener("click", hardRefresh);
+
+        syncButtons();
+        return;
+      }
+
+      for(const g of (board.groups || [])){
         const s = groupStats(g);
 
         const groupEl = document.createElement("div");
@@ -620,13 +1243,15 @@ const INDEX_HTML = `<!doctype html>
 
     function syncButtons(){
       const hasSel = !!(selected.groupId && selected.itemId);
-      $("#btnAddItem").disabled = board.groups.length === 0;
-      $("#btnEditItem").disabled = !hasSel;
-      $("#btnDeleteItem").disabled = !hasSel;
+      $("#btnAddItem").disabled = isOffline || (board.groups?.length === 0);
+      $("#btnEditItem").disabled = isOffline || !hasSel;
+      $("#btnDeleteItem").disabled = isOffline || !hasSel;
+      $("#btnAddGroup").disabled = isOffline;
     }
 
     // ---- Group modal ----
     function openCreateGroup(){
+      if(isOffline) return notify("Sem DB: não dá para criar agora.");
       groupMode = "create";
       editingGroupId = null;
       $("#modalGroupTitle").textContent = "Novo grupo";
@@ -637,6 +1262,7 @@ const INDEX_HTML = `<!doctype html>
     }
 
     function openRenameGroup(gid){
+      if(isOffline) return notify("Sem DB: não dá para editar agora.");
       groupMode = "rename";
       editingGroupId = gid;
       const g = board.groups.find(x => x.id === gid);
@@ -648,24 +1274,31 @@ const INDEX_HTML = `<!doctype html>
     }
 
     async function submitGroup(){
+      if(isOffline) return notify("Sem DB: não dá para guardar agora.");
       const title = ($("#groupTitleInput").value || "").trim();
       if(!title){ $("#groupErr").classList.remove("d-none"); return; }
       $("#groupErr").classList.add("d-none");
 
-      if(groupMode === "create"){
-        await axios.post(API_BASE + "/groups", { title });
-        notify("Grupo criado ✅");
-      }else{
-        await axios.patch(API_BASE + "/groups/" + editingGroupId, { title });
-        notify("Grupo atualizado ✅");
+      try{
+        if(groupMode === "create"){
+          await axios.post(API_BASE + "/groups", { title });
+          notify("Grupo criado ✅");
+        }else{
+          await axios.patch(API_BASE + "/groups/" + editingGroupId, { title });
+          notify("Grupo atualizado ✅");
+        }
+        modalGroup.hide();
+        clearSelection();
+        await loadBoard();
+      }catch(e){
+        setOffline(true);
+        showErrorBanner("Falha ao guardar", e.__friendly || "Erro de servidor/DB.", "Tenta novamente.");
       }
-      modalGroup.hide();
-      clearSelection();
-      await loadBoard();
     }
 
     // ---- Item modal ----
     function openCreateItem(groupId){
+      if(isOffline) return notify("Sem DB: não dá para criar agora.");
       itemMode = "create";
       editingGroupId = groupId;
       editingItemId = null;
@@ -683,6 +1316,7 @@ const INDEX_HTML = `<!doctype html>
     }
 
     function openEditItem(groupId, itemId){
+      if(isOffline) return notify("Sem DB: não dá para editar agora.");
       itemMode = "edit";
       editingGroupId = groupId;
       editingItemId = itemId;
@@ -704,6 +1338,7 @@ const INDEX_HTML = `<!doctype html>
     }
 
     async function submitItem(){
+      if(isOffline) return notify("Sem DB: não dá para guardar agora.");
       const title = ($("#itemTitleInput").value || "").trim();
       if(!title){ $("#itemErr").classList.remove("d-none"); return; }
       $("#itemErr").classList.add("d-none");
@@ -716,17 +1351,22 @@ const INDEX_HTML = `<!doctype html>
         notes: ($("#itemNotesInput").value || "").trim() || null
       };
 
-      if(itemMode === "create"){
-        await axios.post(API_BASE + "/groups/" + editingGroupId + "/items", payload);
-        notify("Item criado ➕");
-      } else {
-        await axios.patch(API_BASE + "/items/" + editingItemId, payload);
-        notify("Item atualizado ✅");
-      }
+      try{
+        if(itemMode === "create"){
+          await axios.post(API_BASE + "/groups/" + editingGroupId + "/items", payload);
+          notify("Item criado ➕");
+        } else {
+          await axios.patch(API_BASE + "/items/" + editingItemId, payload);
+          notify("Item atualizado ✅");
+        }
 
-      modalItem.hide();
-      clearSelection();
-      await loadBoard();
+        modalItem.hide();
+        clearSelection();
+        await loadBoard();
+      }catch(e){
+        setOffline(true);
+        showErrorBanner("Falha ao guardar", e.__friendly || "Erro de servidor/DB.", "Tenta novamente.");
+      }
     }
 
     // ---- Confirm ----
@@ -739,52 +1379,67 @@ const INDEX_HTML = `<!doctype html>
     }
 
     function confirmDeleteGroup(gid){
+      if(isOffline) return notify("Sem DB: não dá para apagar agora.");
       const g = board.groups.find(x => x.id === gid);
       openConfirm(
         "Apagar grupo",
         "Apagar <b>" + escapeHtml(g?.title || "") + "</b> e todos os itens?",
         "Apagar",
         async () => {
-          await axios.delete(API_BASE + "/groups/" + gid);
-          modalConfirm.hide();
-          notify("Grupo apagado 🗑");
-          clearSelection();
-          await loadBoard();
+          try{
+            await axios.delete(API_BASE + "/groups/" + gid);
+            modalConfirm.hide();
+            notify("Grupo apagado 🗑");
+            clearSelection();
+            await loadBoard();
+          }catch(e){
+            setOffline(true);
+            showErrorBanner("Falha ao apagar", e.__friendly || "Erro de servidor/DB.", "Tenta novamente.");
+          }
         }
       );
     }
 
     function confirmDeleteItem(itemId){
+      if(isOffline) return notify("Sem DB: não dá para apagar agora.");
       openConfirm(
         "Apagar item",
         "Confirmar apagar este item?",
         "Apagar",
         async () => {
-          await axios.delete(API_BASE + "/items/" + itemId);
-          modalConfirm.hide();
-          notify("Item apagado 🧹");
-          clearSelection();
-          await loadBoard();
+          try{
+            await axios.delete(API_BASE + "/items/" + itemId);
+            modalConfirm.hide();
+            notify("Item apagado 🧹");
+            clearSelection();
+            await loadBoard();
+          }catch(e){
+            setOffline(true);
+            showErrorBanner("Falha ao apagar", e.__friendly || "Erro de servidor/DB.", "Tenta novamente.");
+          }
         }
       );
     }
 
     // Wire UI
-    $("#btnReload").addEventListener("click", loadBoard);
+    $("#btnReload").addEventListener("click", () => hardRefresh());
     $("#btnAddGroup").addEventListener("click", openCreateGroup);
 
     $("#btnAddItem").addEventListener("click", () => {
+      if(isOffline) return notify("Sem DB: não dá para criar agora.");
       const gid = selected.groupId || board.groups[0]?.id;
       if(!gid) return notify("Cria um grupo primeiro.");
       openCreateItem(gid);
     });
 
     $("#btnEditItem").addEventListener("click", () => {
+      if(isOffline) return notify("Sem DB: não dá para editar agora.");
       if(!selected.groupId || !selected.itemId) return;
       openEditItem(selected.groupId, selected.itemId);
     });
 
     $("#btnDeleteItem").addEventListener("click", () => {
+      if(isOffline) return notify("Sem DB: não dá para apagar agora.");
       if(!selected.itemId) return;
       confirmDeleteItem(selected.itemId);
     });
@@ -799,19 +1454,35 @@ const INDEX_HTML = `<!doctype html>
 
     $("#searchInput").addEventListener("input", () => {
       clearTimeout(window.__t);
-      window.__t = setTimeout(loadBoard, 250);
+      window.__t = setTimeout(() => {
+        if(!isOffline) loadBoard();
+      }, 250);
     });
 
     // init
     (async function init(){
       await checkApi();
-      try{ await loadBoard(); }
-      catch{ notify("Não consegui carregar o board (DB/API?)."); }
+
+      if(window.__BOOT_ERROR__){
+        setOffline(true);
+        showErrorBanner(
+          "Sem ligação à base de dados",
+          window.__BOOT_ERROR__,
+          "A página abriu normalmente. Clica em “Tentar novamente” quando o DB estiver ok."
+        );
+      }
+
+      try{
+        await loadBoard();
+      }catch{
+        // já tratamos em loadBoard()
+      }
     })();
 
-    // Modal enter-to-save (UX)
+    // Enter-to-save (UX)
     $("#groupTitleInput").addEventListener("keydown", (e)=>{ if(e.key==="Enter") submitGroup(); });
     $("#itemTitleInput").addEventListener("keydown", (e)=>{ if(e.key==="Enter") submitItem(); });
   </script>
 </body>
 </html>`;
+}
