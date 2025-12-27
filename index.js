@@ -538,9 +538,7 @@ process.on("uncaughtException", (err) => {
     console.error("DB schema init failed (vou servir UI em modo offline):", safeErrMsg(e));
   }
 
-  app.listen(PORT, () => {
-    console.log(`Server running: http://localhost:${PORT}`);
-  });
+ 
 })();
 
 // -------------------- HTML TEMPLATE (com banner de erro) --------------------
