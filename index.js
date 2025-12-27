@@ -88,6 +88,7 @@ let schemaPromise = null;
 let lastSchemaError = null;
 
 async function ensureSchema() {
+    /*
   if (schemaReady) return true;
   if (schemaPromise) return schemaPromise;
 
@@ -170,6 +171,7 @@ async function ensureSchema() {
   })();
 
   return schemaPromise;
+  */
 }
 
 // Middleware API: se schema/db falhar => 503 (não “quebra” a página)
@@ -490,7 +492,7 @@ app.get(
     // Se der erro no schema, NÃO quebra — injeta um “boot error” para o frontend mostrar banner
     let bootError = null;
     try {
-      await ensureSchema();
+     //  await ensureSchema();
     } catch (e) {
       bootError = "Não consegui ligar à base de dados. A app vai abrir em modo offline.";
       console.error("Schema init error on /:", safeErrMsg(e));
@@ -532,13 +534,15 @@ process.on("uncaughtException", (err) => {
 // -------------------- START --------------------
 (async () => {
   try {
-    await ensureSchema();
+    //await ensureSchema();
     console.log("DB schema ready ✅");
   } catch (e) {
     console.error("DB schema init failed (vou servir UI em modo offline):", safeErrMsg(e));
   }
 
- 
+  app.listen(PORT, () => {
+    console.log(`Server running: http://localhost:${PORT}`);
+  });
 })();
 
 // -------------------- HTML TEMPLATE (com banner de erro) --------------------
